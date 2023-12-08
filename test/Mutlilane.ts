@@ -104,4 +104,94 @@ describe("Multilane", function () {
       expect(await usdc.balanceOf(accounts[1].address)).to.equal(100);
     });
   });
+
+  describe("Pay", function () {
+    it("Deposit and pay 100 USDC", async function () {
+      // In this case we are assuming that user has deposited 100 and he has used 50 usdc in some other chain which want's to pay back
+      const amount = 100;
+      const pay = 50;
+      await deposit(accounts[1], amount);
+      // owner of the contract sign the spending and paid, spending = amount and paid = 0
+      let message = ethers.utils.solidityKeccak256(
+        ["address", "uint256"],
+        [accounts[1].address, pay]
+      );
+      let signature = await accounts[0].signMessage(
+        ethers.utils.arrayify(message)
+      );
+      let { r, s, v } = ethers.utils.splitSignature(signature);
+      let tx = await multilane.connect(accounts[1]).pay(pay, v, r, s);
+      await tx.wait();
+      expect(await multilane.paid(accounts[1].address)).to.equal(50);
+    });
+  });
+
+  describe("Borrow", function () {
+    it("Should borrow 100 USDC", async function () {
+      const amount = 100;
+      // owner of the contract sign the spending and paid, spending = amount and paid = 0
+      let message = ethers.utils.solidityKeccak256(
+        ["address", "uint256"],
+        [accounts[1].address, amount]
+      );
+      let signature = await accounts[0].signMessage(
+        ethers.utils.arrayify(message)
+      );
+      let { r, s, v } = ethers.utils.splitSignature(signature);
+      let tx = await multilane.connect(accounts[1]).borrow(amount, v, r, s);
+      await tx.wait();
+      expect(await multilane.spending(accounts[1].address)).to.equal(amount);
+    });
+
+    it("SCW borrowing and sending money to another person", async function () {
+      // This is a brand new SCW, it does not have any money but user has deposited 100 USDC somewhere
+      // and the contract is paying for the transaction
+      let scwFactory = await ethers.getContractFactory("SCW");
+      let scw = await scwFactory.connect(accounts[1]).deploy();
+      let balance_before = await usdc.balanceOf(multilane.address);
+
+      let amount = 100;
+
+      // contract owner is signing the message
+      let message = ethers.utils.solidityKeccak256(
+        ["address", "uint256"],
+        [accounts[1].address, amount]
+      );
+      let signature = await accounts[0].signMessage(
+        ethers.utils.arrayify(message)
+      );
+
+      let { r, s, v } = ethers.utils.splitSignature(signature);
+
+      // encode data for borrow function call
+      let borrow_data = multilane.interface.encodeFunctionData("borrow", [
+        amount,
+        v,
+        r,
+        s,
+      ]);
+      let borrow_to = multilane.address;
+
+      // encode data to send money to accounts[2]
+      let send_data = usdc.interface.encodeFunctionData("transfer", [
+        accounts[2].address,
+        amount,
+      ]);
+      let send_to = usdc.address;
+
+      // execute both these function together by calling executeBatch in SCW
+      let tx = await scw.executeBatch(
+        [borrow_to, send_to],
+        [0, 0],
+        [borrow_data, send_data]
+      );
+      await tx.wait();
+
+      expect(
+        balance_before.sub(await usdc.balanceOf(multilane.address))
+      ).to.equal(amount);
+      expect(await multilane.spending(accounts[1].address)).to.equal(amount);
+      expect(await usdc.balanceOf(accounts[2].address)).to.equal(amount);
+    });
+  });
 });

@@ -129,4 +129,51 @@ contract Multilane is Ownable {
         // get current block number
         _withdraw(msgSender(), _amount, block.number);
     }
+
+    /**
+     * @dev transfer the money to the contract and remove from user's depoist
+     * @param _pay is the amount of money he is transferring
+     * @param v signature param
+     * @param r signature param
+     * @param s signature param
+     */
+    function pay(uint256 _pay, uint8 v, bytes32 r, bytes32 s) public {
+        require(
+            owner() ==
+                ECDSA.recover(
+                    MessageHashUtils.toEthSignedMessageHash(
+                        keccak256(abi.encodePacked(msgSender(), _pay))
+                    ),
+                    v,
+                    r,
+                    s
+                ),
+            "Invalid signature"
+        );
+        paid[msgSender()] += _pay;
+    }
+
+    /**
+     * @dev borrow: this function is called by the scw. scw will borrow the money from the contract and then execute the transaction.
+     * @param _amount is the amount of money the scw is borrowing, This amount will be signed by the owner of the contract
+     * @param v signature param
+     * @param r signature param
+     * @param s signature param
+     */
+    function borrow(uint256 _amount, uint8 v, bytes32 r, bytes32 s) public {
+        require(
+            owner() ==
+                ECDSA.recover(
+                    MessageHashUtils.toEthSignedMessageHash(
+                        keccak256(abi.encodePacked(msgSender(), _amount))
+                    ),
+                    v,
+                    r,
+                    s
+                ),
+            "Invalid signature"
+        );
+        usdc.transfer(msg.sender, _amount); // Using msg.sender becuase we want the funds to get transfer to the scw not EOA
+        spending[msgSender()] += _amount;
+    }
 }
