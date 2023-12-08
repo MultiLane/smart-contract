@@ -2,6 +2,8 @@
 pragma solidity ^0.8.9;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
 contract Multilane is Ownable {
     mapping(address => uint256) public deposits;
@@ -87,5 +89,44 @@ contract Multilane is Ownable {
         usdc.transferFrom(msg.sender, address(this), _amount);
         deposits[msgSender()] += _amount;
         emit Deposit(msgSender(), _amount);
+    }
+
+    function _withdraw(
+        address _sender,
+        uint256 _amount,
+        uint256 _blockNumber
+    ) internal {
+        if (deposits[_sender] < _amount) {
+            spending[_sender] += _amount; // as the deposit is less than the amount, becuase he has deposited somewhere else. In order for the calculation to work we need to add the amount to spending
+        } else {
+            deposits[_sender] -= _amount;
+        }
+        usdc.transfer(_sender, _amount);
+        emit Withdraw(_sender, _amount, _blockNumber);
+    }
+
+    /**
+     @dev withdraw ERC20 from the contract. Requires approval of contract owner and depositor.
+     @param _amount amount of ERC20 to withdraw
+     @param v signature param
+     @param r signature param
+     @param s signature param
+     */
+    function withdraw(uint256 _amount, uint8 v, bytes32 r, bytes32 s) public {
+        require(deposits[msgSender()] >= _amount, "Insufficient funds");
+        require(
+            owner() ==
+                ECDSA.recover(
+                    MessageHashUtils.toEthSignedMessageHash(
+                        keccak256(abi.encodePacked(msgSender(), _amount))
+                    ),
+                    v,
+                    r,
+                    s
+                ),
+            "Invalid signature"
+        );
+        // get current block number
+        _withdraw(msgSender(), _amount, block.number);
     }
 }

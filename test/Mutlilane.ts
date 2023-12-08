@@ -81,4 +81,27 @@ describe("Multilane", function () {
       expect(await multilane.deposits(accounts[0].address)).to.equal(amount);
     });
   });
+
+  describe("Withdraw", function () {
+    it("Should withdraw 100 USDC", async function () {
+      const amount = 100;
+      let balance_before = await usdc.balanceOf(multilane.address);
+      await deposit(accounts[1], amount);
+      // owner of the contract sign to withdraw funds
+      let message = ethers.utils.solidityKeccak256(
+        ["address", "uint256"],
+        [accounts[1].address, amount]
+      );
+      let signature = await accounts[0].signMessage(
+        ethers.utils.arrayify(message)
+      );
+      let { r, s, v } = ethers.utils.splitSignature(signature);
+      // here whole amount is withdrawn, hence the balance will be same as before
+      let tx = await multilane.connect(accounts[1]).withdraw(amount, v, r, s);
+      await tx.wait();
+      expect(await usdc.balanceOf(multilane.address)).to.equal(balance_before);
+      expect(await multilane.deposits(accounts[1].address)).to.equal(0);
+      expect(await usdc.balanceOf(accounts[1].address)).to.equal(100);
+    });
+  });
 });
