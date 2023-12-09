@@ -2,12 +2,40 @@ import { expect } from "chai";
 import { ethers } from "hardhat";
 import { Multilane } from "../typechain-types/contracts/Multilane";
 import { USDC } from "../typechain-types/contracts/USDC";
+import { MailBox } from "../typechain-types/contracts/MailBox";
 import { SignerWithAddress } from "@nomiclabs/hardhat-ethers/signers";
 
 describe("Multilane", function () {
   let multilane: Multilane;
   let usdc: USDC;
   let accounts: SignerWithAddress[];
+  let mailbox: MailBox;
+
+  let addressToBytes32 = (address: string) => {
+    const bytes32Value = ethers.utils.arrayify(
+      ethers.utils.getAddress(address)
+    );
+    return ethers.utils.hexZeroPad(bytes32Value, 32);
+  };
+
+  let addNewChain = async function (chainId: number) {
+    let mailboxFactory = await ethers.getContractFactory("MailBox");
+    let mailbox = await mailboxFactory.deploy();
+    await mailbox.deployed();
+
+    let WalletLaneFactory = await ethers.getContractFactory("Multilane");
+    let wl = await WalletLaneFactory.deploy(usdc.address);
+
+    let tx = await multilane.addChain(chainId, mailbox.address, wl.address);
+    await tx.wait();
+    // set mailbox address in multilane
+    tx = await wl.setMailBox(mailbox.address);
+    await tx.wait();
+
+    let count = await multilane.getChainCount();
+    // return count - 1 and mailbox address
+    return [count.sub(1).toNumber(), mailbox, wl];
+  };
 
   this.beforeEach(async function () {
     accounts = await ethers.getSigners();
@@ -22,6 +50,14 @@ describe("Multilane", function () {
     // mint some USDC to Multilane
     let tx = await usdc.mint(multilane.address, 100000);
     await tx.wait();
+
+    let mailboxFactory = await ethers.getContractFactory("MailBox");
+    mailbox = await mailboxFactory.deploy();
+    await mailbox.deployed();
+
+    // set mailbox address in multilane
+    tx = await multilane.setMailBox(mailbox.address);
+    await tx.wait();
   });
 
   let deposit = async function (
@@ -35,6 +71,20 @@ describe("Multilane", function () {
     await usdc.connect(account).approve(ml.address, amount);
     await ml.connect(account).deposit(amount);
   };
+
+  describe("Deployment", function () {
+    it("Should set the right owner", async function () {
+      expect(await multilane.owner()).to.equal(accounts[0].address);
+    });
+
+    it("Should set the right USDC address", async function () {
+      expect(await multilane.usdc()).to.equal(usdc.address);
+    });
+
+    it("Should set the right mailbox address", async function () {
+      expect(await multilane.mailBox()).to.equal(mailbox.address);
+    });
+  });
 
   describe("Deposit", function () {
     it("Should deposit 100 USDC", async function () {
@@ -192,6 +242,121 @@ describe("Multilane", function () {
       ).to.equal(amount);
       expect(await multilane.spending(accounts[1].address)).to.equal(amount);
       expect(await usdc.balanceOf(accounts[2].address)).to.equal(amount);
+    });
+  });
+
+  describe("Add and update chains", function () {
+    it("Add new chain", async function () {
+      let chainId = 1;
+      let [index, mailbox, wl] = await addNewChain(chainId);
+      // @ts-ignore
+      let chain = await multilane.chains(index);
+      expect(chain.id).to.equal(chainId);
+      // @ts-ignore
+      expect(chain.mailbox).to.equal(mailbox.address);
+      // @ts-ignore
+      expect(chain.multilane).to.equal(wl.address);
+    });
+
+    it("Update chain", async function () {
+      let chainId = 1;
+      let [index, _] = await addNewChain(chainId);
+      let newMailbox = accounts[1].address; // only for testing purpose
+      let wl = accounts[2].address; // only for testing purpose
+      // @ts-ignore
+      let tx = await multilane.updateChain(index, chainId, newMailbox, wl);
+      await tx.wait();
+      // @ts-ignore
+      let chain = await multilane.chains(index);
+      expect(chain.mailbox).to.equal(newMailbox);
+      expect(chain.multilane).to.equal(wl);
+    });
+  });
+
+  describe("Trustless withdraw", function () {
+    it("Should initiate trustless withdraw", async function () {
+      await addNewChain(1);
+      await addNewChain(2);
+
+      let amount = 100;
+      let tx = await multilane.trustlessWithdraw(amount);
+      let receipt = await tx.wait();
+      // get block number of the transaction
+      let blockNumber = receipt.blockNumber;
+
+      let request = await multilane.withdrawRequests(blockNumber);
+      expect(request.amount).to.equal(amount);
+    });
+
+    it("Withdraw request whole flow", async function () {
+      // Here we are simluating the multiple chains are in one chain by deploying multiple multilane
+      // contracts and they dont interact directly with each other. Mailbox will be used to communicate
+      // Adding chains
+      let [index1, mailbox1, wl1] = await addNewChain(2);
+      let [index2, mailbox2, wl2] = await addNewChain(3);
+
+      // making a deposit in walletLane2, basically making a deposit in chainId 3
+      let walletLane2 = wl2 as Multilane;
+      await deposit(accounts[0], 200, walletLane2);
+
+      // Initiate trustless withdraw request
+      let amount = 100;
+      let tx = await multilane.trustlessWithdraw(amount, {
+        value: ethers.utils.parseEther("0.01"),
+      });
+      await tx.wait();
+
+      // This for chainId 2 ------------------------------------
+      // fetch message in mailbox this is the mailbox in the origin chain
+      let message = await mailbox.messages(0);
+      let mailBox1 = mailbox1 as MailBox;
+      // above message will pass from mailbox to mailbox1 through hyperlane or any bridge
+      tx = await mailBox1.trigger(
+        1,
+        addressToBytes32(multilane.address),
+        message.recipientAddress,
+        message.messageBody
+      );
+      await tx.wait();
+
+      // fetch message in mailbox1 this needs to be passed to multilane
+      let message1 = await mailBox1.messages(0);
+      let walletLane1 = wl1 as Multilane;
+      // this above message will be passed to multilane through hyperlane or any bridge
+      tx = await mailbox.trigger(
+        2,
+        addressToBytes32(walletLane1.address),
+        message1.recipientAddress,
+        message1.messageBody
+      );
+      await tx.wait();
+
+      // end of chainId 2 ----------------------------------------
+
+      // This for chainId 3 ---------------------------------------
+      // fetch message in mailbox this is the mailbox in the origin chain
+      message = await mailbox.messages(1);
+      let mailBox2 = mailbox2 as MailBox;
+      // above message will pass from mailbox to mailbox1 through hyperlane or any bridge
+      tx = await mailBox2.trigger(
+        1,
+        addressToBytes32(multilane.address),
+        message.recipientAddress,
+        message.messageBody
+      );
+      await tx.wait();
+
+      // fetch message in mailbox1 this needs to be passed to multilane
+      let message2 = await mailBox2.messages(0);
+      // this above message will be passed to multilane through hyperlane or any bridge
+      tx = await mailbox.trigger(
+        3,
+        addressToBytes32(walletLane2.address),
+        message2.recipientAddress,
+        message2.messageBody
+      );
+      await tx.wait();
+      // end of chainId 3 ----------------------------------------
     });
   });
 });

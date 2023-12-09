@@ -4,6 +4,7 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import "./MailBox.sol";
 
 contract Multilane is Ownable {
     mapping(address => uint256) public deposits;
@@ -12,6 +13,25 @@ contract Multilane is Ownable {
     event Deposit(address indexed sender, uint256 amount);
     event Withdraw(address indexed sender, uint256 amount, uint256 blockNumber);
     IERC20 public usdc;
+    Chain[] public chains;
+    mapping(uint256 => Chain) public chainMap;
+    mapping(uint256 => TrustlessWithdrawRequest) public withdrawRequests;
+    MailBox public mailBox;
+
+    struct Chain {
+        uint256 id;
+        address mailbox;
+        address multilane;
+    }
+
+    struct TrustlessWithdrawRequest {
+        uint256 totalDeposits;
+        uint256 totalPaid;
+        uint256 totalSpending;
+        uint256 amount;
+        mapping(uint256 => bool) chains; // For keeping track of which chains have updated the above values
+        uint256 chainCount;
+    }
 
     constructor(address _usdc) Ownable(msg.sender) {
         usdc = IERC20(_usdc);
@@ -175,5 +195,201 @@ contract Multilane is Ownable {
         );
         usdc.transfer(msg.sender, _amount); // Using msg.sender becuase we want the funds to get transfer to the scw not EOA
         spending[msgSender()] += _amount;
+    }
+
+    /**
+     * @dev addressToBytes32: convert address to bytes32
+     */
+    function addressToBytes32(address _addr) internal pure returns (bytes32) {
+        return bytes32(uint256(uint160(_addr)));
+    }
+
+    /**
+     * @dev bytes32ToAddress: convert bytes32 to address
+     */
+    function bytes32ToAddress(
+        bytes32 _bytes32
+    ) internal pure returns (address) {
+        return address(uint160(uint256(_bytes32)));
+    }
+
+    /**
+     * @dev trustlessWithdraw: In this function actual spending, paid and deposit is fetched
+     * from different chains and then the money is transfered to the user
+     * @param _amount this is the amount which user is trying to withdraw
+     */
+    function trustlessWithdraw(uint256 _amount) public payable {
+        TrustlessWithdrawRequest storage request = withdrawRequests[
+            block.number
+        ];
+        request.totalDeposits = deposits[msgSender()];
+        request.totalPaid = paid[msgSender()];
+        request.totalSpending = spending[msgSender()];
+        request.amount = _amount;
+        request.chainCount = 0; // chain where this contract is deployed is not counted, this is the count of chains external to this chain
+        uint256 value = msg.value / chains.length;
+        // loop through all the chains and send the request to them
+        for (uint256 i = 0; i < chains.length; i++) {
+            if (chains[i].id != 0) {
+                // send the request to the chain
+                mailBox.dispatch{value: value}(
+                    uint32(chains[i].id),
+                    addressToBytes32(chains[i].multilane),
+                    abi.encode(
+                        0, // 0 is for withdraw Request, 1 is for withdraw Response
+                        msgSender(),
+                        _amount,
+                        block.number,
+                        deposits[msgSender()],
+                        paid[msgSender()],
+                        spending[msgSender()]
+                    )
+                );
+            }
+        }
+    }
+
+    function handleWithdrawRequest(
+        uint32 _origin,
+        bytes32 _sender,
+        address _user,
+        uint256 _amount,
+        uint256 _blockNumber
+    ) internal {
+        mailBox.dispatch(
+            _origin,
+            _sender,
+            abi.encode(
+                1, // 0 is for withdraw Request, 1 is for withdraw Response
+                _user,
+                _amount,
+                _blockNumber,
+                deposits[_user],
+                paid[_user],
+                spending[_user]
+            )
+        );
+    }
+
+    function handle(
+        uint32 _origin,
+        bytes32 _sender,
+        bytes calldata _message
+    ) external payable {
+        require(
+            msg.sender == address(mailBox),
+            "MailboxClient: sender not mailbox"
+        );
+        require(_origin != 0, "WalletLane: origin chain id cannot be 0");
+        require(
+            _sender != bytes32(0),
+            "WalletLane: sender address cannot be 0"
+        );
+        require(_message.length != 0, "WalletLane: message cannot be empty");
+        (
+            uint256 _function,
+            address _user,
+            uint256 _amount,
+            uint256 _blockNumber,
+            uint256 _totalDeposits,
+            uint256 _totalPaid,
+            uint256 _totalSpending
+        ) = abi.decode(
+                _message,
+                (uint256, address, uint256, uint256, uint256, uint256, uint256)
+            );
+        if (_function == 0) {
+            handleWithdrawRequest(
+                _origin,
+                _sender,
+                _user,
+                _amount,
+                _blockNumber
+            );
+            // send all the values to the chain where the request came from
+        } else if (_function == 1) {
+            // check whether chainId and sender address match
+            require(
+                chainMap[_origin].multilane == bytes32ToAddress(_sender),
+                "WalletLane: chainId and sender address do not match"
+            );
+            // check whether this request is already processed by checking chains mapping in the request
+            TrustlessWithdrawRequest storage request = withdrawRequests[
+                _blockNumber
+            ];
+            if (!request.chains[_origin]) {
+                request.chains[_origin] = true;
+                request.chainCount++;
+                request.totalDeposits += _totalDeposits;
+                request.totalPaid += _totalPaid;
+                request.totalSpending += _totalSpending;
+                // // check whether all the chains have responded
+                if (request.chainCount == chains.length) {
+                    uint256 actualBalance = request.totalDeposits -
+                        request.totalSpending +
+                        request.totalPaid;
+                    require(
+                        actualBalance >= request.amount,
+                        "WalletLane: Insufficient funds"
+                    );
+                    // transfer the money to the user
+                    _withdraw(_user, request.amount, _blockNumber);
+                }
+            }
+        }
+    }
+
+    /**
+     * @dev setMailBox: set the address of the walletlane contract
+     * This function could be moved to the constructor but we are keeping it here for testing purposes
+     */
+    function setMailBox(address _mailBoxAddress) public onlyOwner {
+        mailBox = MailBox(_mailBoxAddress);
+    }
+
+    /**
+     @dev add a new chain to the contract
+     @param _id id of the chain
+     @param _mailbox address of the mailbox contract
+     */
+    function addChain(
+        uint256 _id,
+        address _mailbox,
+        address _walletLane
+    ) public onlyOwner {
+        chainMap[_id] = Chain(_id, _mailbox, _walletLane);
+        chains.push(Chain(_id, _mailbox, _walletLane));
+    }
+
+    /**
+     * @dev update chain details
+     * @param _index index of the chain
+     * @param _id id of the chain
+     * @param _mailbox address of the mailbox contract
+     */
+    function updateChain(
+        uint256 _index,
+        uint256 _id,
+        address _mailbox,
+        address _walletLane
+    ) public onlyOwner {
+        chains[_index] = Chain(_id, _mailbox, _walletLane);
+        chainMap[_id] = Chain(_id, _mailbox, _walletLane);
+    }
+
+    /**
+     * @dev delete chain details
+     * @param _index index of the chain
+     */
+    function deleteChain(uint256 _index) public onlyOwner {
+        delete chainMap[chains[_index].id];
+        delete chains[_index];
+    }
+
+    /**
+     * @dev get total number of chains
+     */
+    function getChainCount() public view returns (uint256) {
+        return chains.length;
     }
 }
